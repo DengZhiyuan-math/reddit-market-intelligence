@@ -1,0 +1,23 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Runtime state and generated research artifacts
+outputs/
+*.sqlite
+*.sqlite3
+*.db
+
+# Local planning and development state
+.planning/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/

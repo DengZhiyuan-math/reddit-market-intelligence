@@ -1,0 +1,42 @@
+[project]
+name = "reddit-market-intel"
+version = "0.1.0"
+description = "Compliance-first Reddit market intelligence pipeline"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alembic>=1.17",
+    "beautifulsoup4>=4.14.3",
+    "praw>=7.8",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.12",
+    "pydantic-settings>=2.10",
+    "requests>=2.34.2",
+    "rich>=14.0",
+    "sqlalchemy>=2.0",
+    "typer>=0.20",
+]
+
+[project.scripts]
+reddit-market-intel = "app.cli:app"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "ruff>=0.14",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
