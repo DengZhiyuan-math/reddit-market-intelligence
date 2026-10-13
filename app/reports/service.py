@@ -6,6 +6,10 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app.observability import log_event
+from app.config import Settings
+from app.db.models import LlmCallRecord
+from app.llm.transport import ModelTransport
+from app.reports.provider import RealReportProvider
 from app.reports.generator import build_market_report, render_market_report_markdown
 from app.reports.models import ReportGenerationSummary
 from app.reports.repository import ReportRepository
@@ -23,6 +27,12 @@ def generate_market_report(
     project_id: int,
     output_path: Path | None = None,
     limit: int = 100,
+    *,
+    settings: Settings | None = None,
+    provider=None,
+    signal_ids: list[int] | None = None,
+    content_ids: list[int] | None = None,
+    extraction_run_ids: list[int] | None = None,
 ) -> ReportGenerationSummary:
     """Generate, write, and persist a Markdown market intelligence report."""
 
@@ -51,14 +61,50 @@ def generate_market_report(
                 "format": "markdown",
             },
         )
-        evidence_items = repository.list_evidence_items(project.id, limit=limit)
-        dataset_summary = repository.build_dataset_summary(project.id)
+        evidence_items = repository.list_evidence_items(
+            project.id, limit=limit, signal_ids=signal_ids
+        )
+        dataset_summary = repository.build_dataset_summary(
+            project.id,
+            signal_ids=signal_ids,
+            content_ids=content_ids,
+            extraction_run_ids=extraction_run_ids,
+        )
         report = build_market_report(
             project.project_id,
             project.topic,
             evidence_items,
             dataset_summary,
         )
+        resolved_settings = settings or Settings()
+        synthesizer = provider
+        if synthesizer is None and resolved_settings.report_provider != "deterministic":
+            synthesizer = RealReportProvider(
+                ModelTransport(
+                    resolved_settings,
+                    resolved_settings.report_provider,
+                    resolved_settings.report_model,
+                )
+            )
+        if synthesizer is not None:
+            report = synthesizer.synthesize(report)
+            result = synthesizer.last_result
+            session.add(
+                LlmCallRecord(
+                    project_id=project.id,
+                    run_id=run.id,
+                    call_type="report_synthesis",
+                    provider=result.provider,
+                    model_name=result.model,
+                    input_json={"signal_ids": [item.signal_id for item in evidence_items]},
+                    output_json=result.output,
+                    raw_response_json=result.audit(),
+                    validation_status="validated",
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                )
+            )
+            session.flush()
         markdown = render_market_report_markdown(report)
         _write_report_file(resolved_output_path, markdown)
 
@@ -88,6 +134,7 @@ def generate_market_report(
         )
     except Exception as exc:
         summary.errors += 1
+        summary.report_path = None
         log_event(
             logger,
             "report.generation.failed",

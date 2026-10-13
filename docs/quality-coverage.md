@@ -24,12 +24,25 @@ Live Reddit credentials and live LLM provider calls are not required for automat
 | report rendering/export | `tests/reports/test_models.py`, `tests/reports/test_generator.py`, `tests/reports/test_service.py`, `tests/reports/test_exporter.py`, `tests/reports/test_cli.py` | `tests/quality/test_quality_contracts.py` checks report/export coverage remains documented | Polished DOCX/PDF/slides are outside v1 hardening | `uv run pytest tests/reports -q` |
 | CLI failure readability | `tests/projects/test_cli.py`, `tests/reddit/test_cli.py`, `tests/processing/test_cli.py`, `tests/llm/test_cli.py`, `tests/analysis/test_cli.py`, `tests/reports/test_cli.py` | `tests/quality/test_quality_contracts.py` ensures CLI coverage remains called out | End-user UX polish beyond CLI text is deferred | `uv run pytest tests -q` |
 | fixture demo | Planned in `tests/demo/test_eval_sample.py`, `tests/demo/test_fixture_service.py`, `tests/demo/test_fixture_cli.py` | `tests/quality/test_quality_contracts.py` requires fixture/no-credential demo coverage to be named | Demo data is synthetic and not real market evidence | `uv run pytest tests/demo -q` |
+| Offline no-key export import | `tests/reddit/test_export_import.py` | CLI/service imports, raw Listing and author CSV contracts, BOM/multiline handling, nested replies/more, full-file validation, dry-run, transaction rollback, canonical dedup, batch history, and comment-only rows | Synthetic files and SQLite; no real plugin/browser/Reddit acceptance | `uv run pytest tests/reddit/test_export_import.py -q` |
+| Import through existing analysis and reports | `tests/reddit/test_export_import_pipeline.py`, `tests/reports/test_generator.py` | Real filtering, signal extraction, report and evidence exports; all import methods, API/import project order, source URLs, unique capture counts, missing text and unknown/incomplete coverage | Deterministic providers; no live model or PostgreSQL acceptance | `uv run pytest tests/reddit/test_export_import_pipeline.py tests/processing tests/analysis tests/reports -q` |
 | observability | Planned in `tests/observability/test_logging.py`, `tests/observability/test_service_events.py` | `tests/quality/test_quality_contracts.py` requires structured log coverage to be named | Hosted monitoring, alerting, OpenTelemetry, and dashboards are deferred | `uv run pytest tests/observability -q` |
 
 ## Verification Boundary
+
+| New seam | Local coverage | Boundary |
+|---|---|---|
+| Real native/HTTP models and indexed embeddings | `tests/llm/test_real_providers.py` | Mocked subprocess/HTTP only; strict schemas, failures/refusals, truthful usage, vector validation, narrative citations |
+| Bounded automatic Reddit acquisition | `tests/reddit/test_public_json.py` | Mocked public JSON and existing fake OAuth client; selected queries, item/request limits, new project associations, repeats and durable stops |
+| One real research pipeline | `tests/test_pipeline.py` | Production provider factories with mocked native responses; prior signals excluded by new extraction IDs, stale acquisition refusal, shared budgets, dry-run and prior artifact preservation |
+| Connected browser DOM acquisition | `tests/reddit/test_browser_dom.py`, `tests/fixtures/reddit_dom/`, `tests/test_pipeline.py` | Mocked connected boundary and synthetic literal content using supplied observed selectors; connect/tab ordering, canonical original bodies, unknown coverage, barriers, bounds, importer/new-association scope, genuine report scope and zero-side-effect dry-run |
+
+Run these focused checks with `uv run pytest tests/llm/test_real_providers.py tests/reddit/test_public_json.py tests/test_pipeline.py -q`.
+
+For DOM checks, run `uv run pytest tests/reddit/test_browser_dom.py tests/test_pipeline.py tests/reddit/test_export_import.py tests/reddit/test_export_import_pipeline.py -q`. Passing mocked tests establishes no live browser acquisition or actual-source report. A regression uses the observed v0.33.1 reused-CDP lifecycle response while retaining relaunch/restore rejection.
 
 - Default automated tests must be no-network and no-live-LLM.
 - Tests must not require `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT`, or `OPENAI_API_KEY`.
 - Reddit collection tests should use fakes or sanitized fixtures rather than live Reddit API calls.
 - LLM tests should validate schemas, deterministic providers, persistence, and failure handling rather than live provider behavior.
-- Fixture/demo tests use synthetic Zurich tutoring examples and must label outputs as synthetic demonstration data.
+- Fixture/demo tests use synthetic test records and must label outputs as synthetic demonstration data.

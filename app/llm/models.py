@@ -3,7 +3,7 @@
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class UrgencyLevel(StrEnum):
@@ -36,7 +36,7 @@ class AmbiguityReviewRequest(BaseModel):
     source_id: str
     subreddit: str | None = None
     language: str | None = None
-    relevance_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    relevance_score: float | None = Field(default=None, ge=-1.0, le=1.0)
     quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
     ambiguity_score: float | None = Field(default=None, ge=0.0, le=1.0)
     classification_labels: list[str] = Field(default_factory=list)
@@ -47,6 +47,8 @@ class AmbiguityReviewRequest(BaseModel):
 
 class AmbiguityReviewOutput(BaseModel):
     """Validated JSON output for one ambiguous Reddit content item."""
+
+    model_config = ConfigDict(extra="forbid")
 
     is_relevant: bool
     relevance_score: float = Field(ge=0.0, le=1.0)

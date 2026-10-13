@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.compliance.policies import AccessMode
@@ -52,3 +52,18 @@ class Settings(BaseSettings):
     signal_extraction_max_retries: int = Field(default=1, ge=0)
     signal_extraction_default_limit: int = Field(default=25, ge=1)
     signal_extraction_confidence_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
+
+    model_api_base_url: str = "https://api.openai.com/v1"
+    model_api_key: SecretStr | None = None
+    codex_executable: str = "codex"
+    model_timeout_seconds: float = Field(default=120, gt=0, le=300)
+    real_model_provider: str = "codex-cli"
+    real_model: str = "gpt-6.1-sol"
+    topic_planner_provider: str = "deterministic"
+    topic_planner_model: str = "topic-rules-v1"
+    report_provider: str = "deterministic"
+    report_model: str = "report-template-v1"
+    browser_dom_executable: str = "agent-browser"
+    browser_dom_cdp_url: str | None = None
+    browser_dom_session: str = "reddit-dom"
+    browser_dom_timeout_seconds: float = Field(default=20, gt=0, le=60)

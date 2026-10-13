@@ -3,8 +3,8 @@
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.llm.providers import embedding_provider as make_embedding_provider
 from app.processing.embeddings import (
-    DeterministicEmbeddingProvider,
     EmbeddingProvider,
     embedding_text_hash,
 )
@@ -29,32 +29,44 @@ def run_filtering(
     embedding_provider: EmbeddingProvider | None = None,
     *,
     settings: Settings | None = None,
+    source_scope: dict[str, list[str]] | None = None,
+    lexical_review_all: bool = False,
 ) -> FilteringRunSummary:
     """Run content cleaning, embedding, and relevance routing for one project."""
 
     resolved_settings = settings or Settings()
-    provider = embedding_provider or DeterministicEmbeddingProvider(
-        dimensions=resolved_settings.embedding_dimensions,
-        model=resolved_settings.embedding_model,
-        provider=resolved_settings.embedding_provider,
-    )
+    provider = embedding_provider or make_embedding_provider(resolved_settings)
     repository = ProcessingRepository(session)
     project = repository.get_project_by_project_id(project_id)
     run = repository.start_filtering_run(
         project.id,
         {
             "limit": limit,
-            "embedding_provider": resolved_settings.embedding_provider,
-            "embedding_model": resolved_settings.embedding_model,
+            "embedding_provider": getattr(provider, "provider", type(provider).__name__),
+            "embedding_model": getattr(provider, "model", "unknown"),
             "accept_threshold": resolved_settings.relevance_accept_threshold,
             "reject_threshold": resolved_settings.relevance_reject_threshold,
         },
     )
     summary = FilteringRunSummary()
     try:
-        summary.raw_posts_processed = len(repository.list_raw_project_posts(project.id, limit=limit))
+        summary.raw_posts_processed = len(
+            repository.list_raw_project_posts(
+                project.id,
+                limit=limit,
+                source_ids=source_scope.get("reddit_post", [])
+                if source_scope is not None
+                else None,
+            )
+        )
         summary.raw_comments_processed = len(
-            repository.list_raw_project_comments(project.id, limit=limit)
+            repository.list_raw_project_comments(
+                project.id,
+                limit=limit,
+                source_ids=source_scope.get("reddit_comment", [])
+                if source_scope is not None
+                else None,
+            )
         )
         topic_plan = repository.get_selected_research_plan(project.id)
         topic_text = build_topic_text(project, topic_plan)
@@ -63,6 +75,7 @@ def run_filtering(
             project=project,
             run_id=run.id,
             limit=limit,
+            source_scope=source_scope,
         )
         for content_item, inserted in materialized:
             if inserted:
@@ -87,6 +100,8 @@ def run_filtering(
                 resolved_settings.relevance_accept_threshold,
                 resolved_settings.relevance_reject_threshold,
             )
+            if lexical_review_all:
+                route = AMBIGUOUS
             requires_review = route == AMBIGUOUS
             repository.upsert_content_embedding(
                 content_item=content_item,
@@ -143,4 +158,3 @@ def _is_hard_rejected(content_item) -> bool:
 
 def _has_reason(content_item, code: str) -> bool:
     return any(reason.get("code") == code for reason in content_item.reason_codes)
-

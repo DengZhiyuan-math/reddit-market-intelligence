@@ -3,8 +3,14 @@
 import hashlib
 import math
 from typing import Protocol
+from urllib.parse import urlsplit
+
+import requests
 
 from pydantic import BaseModel, Field
+
+from app.config import Settings
+from app.llm.transport import ModelUnavailable, RunBudget
 
 
 class EmbeddingResult(BaseModel):
@@ -61,19 +67,84 @@ class DeterministicEmbeddingProvider:
 
 
 class OpenAICompatibleEmbeddingProvider:
-    """Placeholder boundary for a future OpenAI-compatible embeddings adapter."""
+    """Bounded indexed embedding requests using the installed HTTP client."""
 
-    def __init__(self, *, model: str, provider: str = "codex-gpt-5.2") -> None:
+    def __init__(
+        self,
+        *,
+        model: str,
+        provider: str = "openai-compatible",
+        settings: Settings | None = None,
+        budget: RunBudget | None = None,
+    ) -> None:
         self.model = model
         self.provider = provider
+        self.settings = settings or Settings()
+        self.budget = budget or RunBudget()
 
     def embed(self, texts: list[str]) -> list[EmbeddingResult]:
-        """Raise until Phase 6 runtime wires a concrete API client."""
-
-        raise NotImplementedError(
-            "OpenAI-compatible embedding calls require a configured API client; "
-            "use DeterministicEmbeddingProvider for tests/offline runs."
+        """Validate response indices, vector dimensions and finite values."""
+        settings = self.settings
+        if not settings.model_api_key:
+            raise ModelUnavailable("Embedding API key is missing")
+        base = settings.model_api_base_url.rstrip("/")
+        parsed = urlsplit(base)
+        if parsed.scheme != "https" or parsed.username or parsed.password:
+            raise ModelUnavailable("Embedding endpoint must be HTTPS without embedded credentials")
+        self.budget.model_attempt()
+        try:
+            response = requests.post(
+                base + "/embeddings",
+                headers={"Authorization": "Bearer " + settings.model_api_key.get_secret_value()},
+                json={
+                    "model": self.model,
+                    "input": texts,
+                    "dimensions": settings.embedding_dimensions,
+                },
+                timeout=self.budget.timeout(settings.model_timeout_seconds),
+                allow_redirects=False,
+            )
+            if response.status_code != 200:
+                raise ValueError("HTTP failure")
+            body = response.json()
+            indexed = {}
+            for row in body["data"]:
+                index, vector = row["index"], row["embedding"]
+                if type(index) is not int or index in indexed or index < 0 or index >= len(texts):
+                    raise ValueError("Invalid embedding index")
+                if len(vector) != settings.embedding_dimensions or any(
+                    type(value) not in (int, float) or not math.isfinite(value) for value in vector
+                ):
+                    raise ValueError("Invalid embedding vector")
+                indexed[index] = EmbeddingResult(
+                    vector=vector,
+                    model=body.get("model") or self.model,
+                    provider="openai-compatible",
+                    dimensions=len(vector),
+                )
+            if set(indexed) != set(range(len(texts))):
+                raise ValueError("Missing embedding index")
+        except Exception as exc:
+            self.budget.audit.append(
+                {
+                    "provider": "openai-compatible",
+                    "model": self.model,
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "cost_estimate": None,
+                }
+            )
+            raise ModelUnavailable("Embedding call failed or returned invalid vectors") from None
+        self.budget.audit.append(
+            {
+                "provider": "openai-compatible",
+                "model": body.get("model") or self.model,
+                "usage": body.get("usage"),
+                "cost_estimate": None,
+                "status": "validated",
+            }
         )
+        return [indexed[index] for index in range(len(texts))]
 
 
 def embedding_text_hash(text: str) -> str:
@@ -84,4 +155,3 @@ def embedding_text_hash(text: str) -> str:
 
 def _tokens(text: str) -> list[str]:
     return [token.strip(".,!?;:()[]{}\"'").casefold() for token in text.split() if token.strip()]
-

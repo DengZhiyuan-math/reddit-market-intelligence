@@ -35,8 +35,8 @@ class DeterministicSignalProvider:
         model: str = "gpt-5.2-codex",
         fixture_output: dict | str | None = None,
     ) -> None:
-        self.provider = provider
-        self.model = model
+        self.provider = "deterministic"
+        self.model = "signal-rules-v1"
         self.fixture_output = fixture_output
 
     def extract(self, request: SignalExtractionRequest) -> SignalExtractionProviderResult:

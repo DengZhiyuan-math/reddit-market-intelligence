@@ -50,7 +50,7 @@ class RedditClientFactory:
             message="Reddit credentials are configured for read-only collection.",
         )
 
-    def create_read_only_client(self) -> Any:
+    def create_read_only_client(self, *, timeout: float | None = None) -> Any:
         """Create a read-only PRAW client after validating settings."""
 
         status = self.validate_settings(self.settings)
@@ -63,6 +63,7 @@ class RedditClientFactory:
             client_secret=self.settings.reddit_client_secret,
             user_agent=self.settings.reddit_user_agent,
             ratelimit_seconds=self.settings.reddit_ratelimit_seconds,
+            **({"requestor_kwargs": {"timeout": timeout}} if timeout is not None else {}),
         )
         if getattr(reddit, "read_only", True) is not True:
             raise RedditConfigurationError("Reddit client must be read-only.")

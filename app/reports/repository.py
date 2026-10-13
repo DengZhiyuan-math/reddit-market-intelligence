@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urljoin
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,6 +15,10 @@ from app.db.models import (
     PipelineRunRecord,
     ReportArtifactRecord,
     ResearchProjectRecord,
+    ProjectRedditPostRecord,
+    ProjectRedditCommentRecord,
+    RedditPostRawRecord,
+    RedditCommentRawRecord,
 )
 from app.reports.models import (
     ReportDatasetSummary,
@@ -45,6 +50,7 @@ class ReportRepository:
         self,
         project_db_id: int,
         limit: int | None = None,
+        signal_ids: list[int] | None = None,
     ) -> list[ReportEvidenceItem]:
         """Return trusted market signals with source links for reporting."""
 
@@ -57,16 +63,136 @@ class ReportRepository:
                 MarketSignalRecord.id,
             )
         )
+        if signal_ids is not None:
+            statement = statement.where(MarketSignalRecord.id.in_(signal_ids))
         if limit is not None:
             statement = statement.limit(limit)
 
         evidence_items: list[ReportEvidenceItem] = []
         for signal in self.session.scalars(statement):
             item = self.session.get(ContentItemRecord, signal.content_item_id)
-            evidence_items.append(_evidence_item_from_records(signal, item))
+            evidence = _evidence_item_from_records(signal, item)
+            evidence.source_url = self._source_url(project_db_id, item)
+            evidence_items.append(evidence)
         return evidence_items
 
-    def build_dataset_summary(self, project_db_id: int) -> ReportDatasetSummary:
+    def _source_url(self, project_db_id: int, item: ContentItemRecord | None) -> str | None:
+        if item is None or item.source_type not in {"reddit_post", "reddit_comment"}:
+            return None
+        if item.source_type == "reddit_post":
+            raw_type, association_type, raw_key, link_key = (
+                RedditPostRawRecord,
+                ProjectRedditPostRecord,
+                RedditPostRawRecord.reddit_post_id,
+                ProjectRedditPostRecord.reddit_post_raw_id,
+            )
+        else:
+            raw_type, association_type, raw_key, link_key = (
+                RedditCommentRawRecord,
+                ProjectRedditCommentRecord,
+                RedditCommentRawRecord.reddit_comment_id,
+                ProjectRedditCommentRecord.reddit_comment_raw_id,
+            )
+        raw = self.session.scalar(select(raw_type).where(raw_key == item.source_id))
+        if raw is None:
+            return None
+        association = self.session.scalar(
+            select(association_type)
+            .where(association_type.project_id == project_db_id, link_key == raw.id)
+            .order_by(association_type.id)
+        )
+        if association and "source_snapshot" in (association.filters_json or {}):
+            url = association.filters_json["source_snapshot"].get("permalink")
+            return urljoin("https://www.reddit.com", url) if url else None
+        url = (association.filters_json or {}).get("source_url") if association else None
+        if not url and association and association.run_id:
+            run = self.session.get(PipelineRunRecord, association.run_id)
+            if run:
+                kind = "post" if item.source_type == "reddit_post" else "comment"
+                url = next(
+                    (
+                        entry.get("source_url")
+                        for entry in run.summary.get("items", [])
+                        if entry.get("id") == item.source_id and entry.get("type") == kind
+                    ),
+                    None,
+                )
+        url = (
+            url
+            or raw.permalink
+            or raw.raw_json.get("permalink")
+            or raw.raw_json.get("source_snapshot", {}).get("permalink")
+        )
+        return urljoin("https://www.reddit.com", url) if url else None
+
+    def _import_summary(
+        self, project_db_id: int, source_scope: dict[str, list[str]] | None = None
+    ) -> dict[str, Any]:
+        batches, items, coverage, comments_by_post = [], set(), {}, {}
+        runs = self.session.scalars(
+            select(PipelineRunRecord)
+            .where(
+                PipelineRunRecord.project_id == project_db_id,
+                PipelineRunRecord.stage == "reddit_collection",
+                PipelineRunRecord.status == "completed",
+            )
+            .order_by(PipelineRunRecord.id)
+        )
+        for run in runs:
+            if run.run_config.get("input_format") not in {"listing_json", "rows_json", "csv"}:
+                continue
+            scoped_items = [
+                item
+                for item in run.summary.get("items", [])
+                if source_scope is None
+                or item["id"] in source_scope.get("reddit_" + item["type"], [])
+            ]
+            if source_scope is not None and not scoped_items:
+                continue
+            discussion_ids = {item["post_id"] for item in scoped_items}
+            batches.append(
+                {
+                    "run_id": run.id,
+                    "capture": {
+                        key: value
+                        for key, value in run.run_config.items()
+                        if key != "source_snapshot"
+                    },
+                    "coverage": {
+                        key: value for key, value in run.summary.items() if key != "items"
+                    },
+                }
+            )
+            for item in scoped_items:
+                items.add((item["type"], item["id"]))
+                if item["type"] == "comment":
+                    comments_by_post.setdefault(item["post_id"], set()).add(item["id"])
+            for pid, value in run.summary.get("post_coverage", {}).items():
+                if source_scope is not None and pid not in discussion_ids:
+                    continue
+                existing = coverage.setdefault(
+                    pid, {"comments_complete": "unknown", "captured_comments": 0}
+                )
+                if value.get("comments_complete") == "incomplete":
+                    existing["comments_complete"] = "incomplete"
+        for pid, value in coverage.items():
+            value["captured_comments"] = len(comments_by_post.get(pid, set()))
+        return dict(
+            import_batches=batches,
+            import_unique_posts=sum(kind == "post" for kind, _ in items),
+            import_unique_comments=sum(kind == "comment" for kind, _ in items),
+            import_discussions=len(coverage),
+            import_coverage=coverage,
+        )
+
+    def build_dataset_summary(
+        self,
+        project_db_id: int,
+        *,
+        signal_ids: list[int] | None = None,
+        content_ids: list[int] | None = None,
+        extraction_run_ids: list[int] | None = None,
+    ) -> ReportDatasetSummary:
         """Build aggregate report inputs without promoting abstentions to evidence."""
 
         signals = list(
@@ -79,6 +205,10 @@ class ReportRepository:
                 select(ContentItemRecord).where(ContentItemRecord.project_id == project_db_id)
             )
         )
+        if signal_ids is not None:
+            signals = [item for item in signals if item.id in signal_ids]
+        if content_ids is not None:
+            content_items = [item for item in content_items if item.id in content_ids]
         calls = self.session.scalars(
             select(LlmCallRecord).where(
                 LlmCallRecord.project_id == project_db_id,
@@ -89,6 +219,8 @@ class ReportRepository:
         abstained_count = 0
         uncertain_count = 0
         for call in calls:
+            if extraction_run_ids is not None and call.run_id not in extraction_run_ids:
+                continue
             status = (call.output_json or {}).get("status")
             if status == "abstained":
                 abstained_count += 1
@@ -105,6 +237,23 @@ class ReportRepository:
             source_mode_counts=_count_values(item.source_mode for item in content_items),
             abstained_count=abstained_count,
             uncertain_count=uncertain_count,
+            **self._import_summary(
+                project_db_id,
+                {
+                    "reddit_post": [
+                        item.source_id
+                        for item in content_items
+                        if item.source_type == "reddit_post"
+                    ],
+                    "reddit_comment": [
+                        item.source_id
+                        for item in content_items
+                        if item.source_type == "reddit_comment"
+                    ],
+                }
+                if content_ids is not None
+                else None,
+            ),
         )
 
     def start_report_run(self, project_db_id: int, run_config: dict[str, Any]) -> PipelineRunRecord:

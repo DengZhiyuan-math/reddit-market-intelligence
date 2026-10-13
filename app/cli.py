@@ -18,6 +18,9 @@ from sqlalchemy.orm import sessionmaker
 
 from app.compliance.policies import AccessMode
 from app.config import Settings
+from app.pipeline import pipeline_preflight, run_pipeline, resume_pipeline, pipeline_status
+from app.reddit.builtin_browser import prepare_browser_task
+from app.processing.repository import ProcessingRepository
 from app.db.base import Base
 from app.db.import_registry import import_project_registry
 from app.db.session import session_scope
@@ -29,7 +32,13 @@ from app.demo.service import run_fixture_demo
 from app.llm.exporter import export_review_queue
 from app.llm.models import LlmReviewRunSummary
 from app.llm.service import LlmReviewServiceError, run_llm_review
-from app.projects.models import ProjectCreateInput, ResearchProject, RunConfig, StageRun, StageStatus
+from app.projects.models import (
+    ProjectCreateInput,
+    ResearchProject,
+    RunConfig,
+    StageRun,
+    StageStatus,
+)
 from app.projects.service import (
     ProjectNotFoundError,
     create_project,
@@ -41,6 +50,7 @@ from app.processing.exporter import export_calibration_samples
 from app.processing.models import FilteringRunSummary
 from app.processing.service import ProcessingServiceError, run_filtering
 from app.reddit.models import CollectionRunSummary
+from app.reddit.export_import import import_reddit_export
 from app.reddit.service import (
     RedditCollectionServiceError,
     run_reddit_collection,
@@ -74,6 +84,7 @@ llm_app = typer.Typer(help="Review ambiguous content with the LLM gateway.")
 analysis_app = typer.Typer(help="Extract and inspect market signals.")
 reports_app = typer.Typer(help="Generate reports and export report evidence.")
 demo_app = typer.Typer(help="Run no-credential synthetic fixture demos.")
+pipeline_app = typer.Typer(help="Run bounded acquisition and real-model research.")
 app.add_typer(projects_app, name="projects")
 app.add_typer(db_app, name="db")
 app.add_typer(plans_app, name="plans")
@@ -83,6 +94,7 @@ app.add_typer(llm_app, name="llm")
 app.add_typer(analysis_app, name="analysis")
 app.add_typer(reports_app, name="reports")
 app.add_typer(demo_app, name="demo")
+app.add_typer(pipeline_app, name="pipeline")
 
 console = Console()
 error_console = Console(stderr=True)
@@ -597,7 +609,9 @@ def db_preflight_command(
 def plans_generate_command(
     project_id: int = typer.Option(..., "--project-id", help="Database project ID to plan."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Generate JSON without persisting."),
-    selected: bool = typer.Option(True, "--selected/--not-selected", help="Mark persisted plan selected."),
+    selected: bool = typer.Option(
+        True, "--selected/--not-selected", help="Mark persisted plan selected."
+    ),
 ) -> None:
     """Generate a structured Reddit research plan for a project."""
 
@@ -788,6 +802,63 @@ def reddit_discover_urls_command(
         raise typer.Exit(code=1) from exc
 
     _print_discovery_summary(summary)
+
+
+@reddit_app.command("import-export")
+def reddit_import_export_command(
+    project_id: int = typer.Option(..., "--project-id", help="Durable database project ID."),
+    input_path: Path = typer.Option(
+        ...,
+        "--input-path",
+        exists=True,
+        dir_okay=False,
+        help="Saved Reddit JSON or structured CSV file.",
+    ),
+    acquisition_method: str = typer.Option(
+        ..., "--acquisition-method", help="web_json, manual_web, or dom."
+    ),
+    source_url: str | None = typer.Option(
+        None, "--source-url", help="Batch listing or discussion URL."
+    ),
+    query: str | None = typer.Option(None, "--query", help="Recorded discovery query."),
+    sort: str | None = typer.Option(None, "--sort", help="Recorded source sort order."),
+    time_window: str | None = typer.Option(
+        None, "--time-window", help="Recorded source time window."
+    ),
+    captured_at: str | None = typer.Option(
+        None, "--captured-at", help="Capture timestamp with UTC offset; unknown if omitted."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Validate and report coverage without writes."
+    ),
+) -> None:
+    """Import externally saved evidence without Reddit or Google credentials."""
+    try:
+        with session_scope() as session:
+            summary = import_reddit_export(
+                session,
+                project_id=project_id,
+                input_path=input_path,
+                acquisition_method=acquisition_method,
+                source_url=source_url,
+                query=query,
+                sort=sort,
+                time_window=time_window,
+                captured_at=captured_at,
+                dry_run=dry_run,
+            )
+    except Exception as exc:
+        error_console.print(f"Export import failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print("Dry-run: no writes" if dry_run else f"Import run: {summary.run_id}")
+    console.print(f"Captured posts: {summary.captured_posts}")
+    console.print(f"Captured comments: {summary.captured_comments}")
+    console.print(f"Stored posts/comments: {summary.stored_posts}/{summary.stored_comments}")
+    console.print(
+        f"Database duplicates posts/comments: {summary.duplicate_posts}/{summary.duplicate_comments}"
+    )
+    for warning in summary.warnings:
+        console.print(f"Warning: {warning}")
 
 
 @reddit_app.command("collect-fallback")
@@ -1032,6 +1103,185 @@ def reports_export_evidence_command(
 
     console.print(f"Exported report evidence Markdown to {markdown_path}.")
     console.print(f"Exported report evidence CSV to {csv_path}.")
+
+
+@pipeline_app.command("browser-task")
+def pipeline_browser_task_command(
+    project_id: int = typer.Option(..., "--project-id"),
+    since: str = typer.Option(..., "--since", help="Inclusive ISO timestamp with timezone."),
+    until: str = typer.Option(..., "--until", help="Inclusive ISO timestamp with timezone."),
+    output_path: Path = typer.Option(..., "--output-path"),
+    max_items: int = typer.Option(100, "--max-items", min=1, max=100),
+    max_queries: int = typer.Option(3, "--max-queries", min=1, max=24),
+    max_discussions: int = typer.Option(16, "--max-discussions", min=1, max=100),
+) -> None:
+    """Prepare a selected plan for collection by Codex in-app browser tools."""
+    try:
+        with session_scope() as session:
+            repo = ProcessingRepository(session)
+            project = repo.get_project_by_project_id(project_id)
+            selected = repo.get_selected_research_plan(project.id)
+            if selected is None:
+                raise ValueError("Generate and select a research plan first")
+            plan = get_topic_plan(session, selected.id)
+            task = prepare_browser_task(
+                project_id=project_id,
+                plan_id=selected.id,
+                queries=plan.topic_plan.query_strategy,
+                since=since,
+                until=until,
+                max_items=max_items,
+                max_queries=max_queries,
+                max_discussions=max_discussions,
+            )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("x", encoding="utf-8") as output:
+            output.write(json.dumps(task, ensure_ascii=False, indent=2))
+    except Exception as exc:
+        error_console.print(f"Browser task failed: {exc}")
+        raise typer.Exit(1) from None
+    console.print(f"Browser task: {output_path}")
+
+
+@pipeline_app.command("preflight")
+def pipeline_preflight_command(
+    project_id: int = typer.Option(..., "--project-id"),
+    source: str = typer.Option(
+        "auto",
+        "--source",
+        help="existing, imported, auto, reddit-api, public-json, browser-dom, builtin-browser-dom.",
+    ),
+    allow_browser_dom: bool = typer.Option(
+        False,
+        "--allow-browser-dom",
+        help="Allow connected DOM when auto has no OAuth configuration.",
+    ),
+    allow_public_json: bool = typer.Option(False, "--allow-public-json"),
+    browser_capture_path: Path | None = typer.Option(None, "--browser-capture-path"),
+) -> None:
+    """Check configuration and native login; source network access remains unobserved."""
+    try:
+        with session_scope() as session:
+            result = pipeline_preflight(
+                session,
+                project_id,
+                source=source,
+                allow_public_json=allow_public_json,
+                allow_browser_dom=allow_browser_dom,
+                browser_capture_path=browser_capture_path,
+            )
+    except Exception as exc:
+        error_console.print(f"Pipeline preflight failed ({type(exc).__name__})")
+        raise typer.Exit(1) from None
+    console.print_json(data=result)
+    if not result["ready"]:
+        raise typer.Exit(1)
+
+
+@pipeline_app.command("run")
+def pipeline_run_command(
+    project_id: int = typer.Option(..., "--project-id"),
+    source: str = typer.Option(
+        "auto",
+        "--source",
+        help="existing, imported, auto, reddit-api, public-json, browser-dom, builtin-browser-dom.",
+    ),
+    allow_browser_dom: bool = typer.Option(
+        False,
+        "--allow-browser-dom",
+        help="Allow connected DOM when auto has no OAuth configuration.",
+    ),
+    allow_public_json: bool = typer.Option(
+        False, "--allow-public-json", help="Allow public JSON when auto has no OAuth configuration."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="No model, subprocess, source requests, writes or artifacts."
+    ),
+    output_dir: Path = typer.Option(
+        Path("outputs/research"),
+        "--output-dir",
+        help="A unique run subdirectory preserves prior artifacts.",
+    ),
+    max_queries: int = typer.Option(3, "--max-queries", min=1, max=24),
+    max_items: int = typer.Option(10, "--max-items", min=1, max=100),
+    max_analysis_items: int | None = typer.Option(None, "--max-analysis-items", min=1, max=100),
+    browser_capture_path: Path | None = typer.Option(None, "--browser-capture-path"),
+    since: str | None = typer.Option(
+        None, "--since", help="Browser window start; defaults to 365 days before --until."
+    ),
+    until: str | None = typer.Option(
+        None, "--until", help="Browser window end; defaults to current UTC time."
+    ),
+    max_requests: int = typer.Option(16, "--max-requests", min=1, max=100),
+    max_model_calls: int = typer.Option(24, "--max-model-calls", min=1, max=200),
+    max_browser_operations: int = typer.Option(80, "--max-browser-operations", min=1, max=400),
+    max_seconds: float = typer.Option(300, "--max-seconds", min=1, max=3600),
+) -> None:
+    """Run one scoped research pipeline with real providers and shared finite budgets."""
+    try:
+        with session_scope() as session:
+            result = run_pipeline(
+                session,
+                project_id,
+                source=source,
+                allow_public_json=allow_public_json,
+                allow_browser_dom=allow_browser_dom,
+                dry_run=dry_run,
+                output_dir=output_dir,
+                max_queries=max_queries,
+                max_items=max_items,
+                max_analysis_items=max_analysis_items,
+                browser_capture_path=browser_capture_path,
+                since=since,
+                until=until,
+                max_requests=max_requests,
+                max_model_calls=max_model_calls,
+                max_seconds=max_seconds,
+                max_browser_operations=max_browser_operations,
+            )
+    except Exception as exc:
+        error_console.print(f"Pipeline could not start ({type(exc).__name__})")
+        raise typer.Exit(1) from None
+    _print_pipeline_result(result)
+
+
+def _print_pipeline_result(result):
+    console.print_json(data=result)
+    if result["status"] not in {"completed", "dry_run", "awaiting_browser"}:
+        raise typer.Exit(1)
+
+
+@pipeline_app.command("resume")
+def pipeline_resume_command(
+    run_id: int = typer.Option(..., "--run-id"),
+    browser_capture_path: Path | None = typer.Option(None, "--browser-capture-path"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Resume with frozen limits and reuse completed stages."""
+    try:
+        with session_scope() as session:
+            result = resume_pipeline(
+                session, run_id, browser_capture_path=browser_capture_path, dry_run=dry_run
+            )
+    except Exception as exc:
+        error_console.print(f"Pipeline resume failed: {exc}")
+        raise typer.Exit(1) from None
+    _print_pipeline_result(result)
+
+
+@pipeline_app.command("status")
+def pipeline_status_command(
+    project_id: int | None = typer.Option(None, "--project-id"),
+    run_id: int | None = typer.Option(None, "--run-id"),
+) -> None:
+    """Read the latest project run or an exact run without model calls."""
+    try:
+        with session_scope() as session:
+            result = pipeline_status(session, project_id=project_id, run_id=run_id)
+    except Exception as exc:
+        error_console.print(f"Pipeline status failed: {exc}")
+        raise typer.Exit(1) from None
+    console.print_json(data=result)
 
 
 @demo_app.command("run-fixture")

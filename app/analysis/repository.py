@@ -22,6 +22,7 @@ from app.db.models import (
 from app.llm.models import LlmValidationStatus
 from app.llm.repository import AMBIGUITY_REVIEW
 from app.processing.models import ACCEPTED
+from app.processing.repository import ProcessingRepository
 
 MARKET_SIGNAL_EXTRACTION = "market_signal_extraction"
 
@@ -46,6 +47,8 @@ class SignalExtractionRepository:
         self,
         project_db_id: int,
         limit: int | None = None,
+        content_ids: list[int] | None = None,
+        force: bool = False,
     ) -> list[EvidenceCandidate]:
         """Return accepted and validated-relevant evidence not already extracted."""
 
@@ -53,11 +56,23 @@ class SignalExtractionRepository:
         if project is None:
             raise ValueError(f"Project not found in database: {project_db_id}")
 
-        candidates = self._accepted_content_candidates(project)
-        candidates.extend(self._validated_relevant_judgement_candidates(project))
-        candidates.sort(key=lambda candidate: (candidate.content_item_id, candidate.llm_judgement_id or 0))
+        candidates = self._accepted_content_candidates(project, force=force)
+        candidates.extend(self._validated_relevant_judgement_candidates(project, force=force))
+        if force:
+            unique = {}
+            for candidate in candidates:
+                unique.setdefault(candidate.content_item_id, candidate)
+            candidates = list(unique.values())
+        if content_ids is not None:
+            candidates = [item for item in candidates if item.content_item_id in content_ids]
+        candidates.sort(
+            key=lambda candidate: (candidate.content_item_id, candidate.llm_judgement_id or 0)
+        )
         if limit is not None:
-            return candidates[:limit]
+            candidates = candidates[:limit]
+        for candidate in candidates:
+            item = self.session.get(ContentItemRecord, candidate.content_item_id)
+            candidate.metadata.update(ProcessingRepository(self.session).get_source_context(item))
         return candidates
 
     def has_existing_signals(self, content_item_id: int, llm_judgement_id: int | None) -> bool:
@@ -169,6 +184,7 @@ class SignalExtractionRepository:
     def _accepted_content_candidates(
         self,
         project: ResearchProjectRecord,
+        force: bool = False,
     ) -> list[EvidenceCandidate]:
         statement = (
             select(ContentItemRecord)
@@ -180,13 +196,14 @@ class SignalExtractionRepository:
         )
         candidates: list[EvidenceCandidate] = []
         for item in self.session.scalars(statement):
-            if not self.has_existing_signals(item.id, None):
+            if force or not self.has_existing_signals(item.id, None):
                 candidates.append(_candidate_from_item(project, item))
         return candidates
 
     def _validated_relevant_judgement_candidates(
         self,
         project: ResearchProjectRecord,
+        force: bool = False,
     ) -> list[EvidenceCandidate]:
         statement = (
             select(LlmJudgementRecord)
@@ -199,10 +216,15 @@ class SignalExtractionRepository:
             .order_by(ContentItemRecord.id, LlmJudgementRecord.id)
         )
         candidates: list[EvidenceCandidate] = []
-        for judgement in self.session.scalars(statement):
+        seen = set()
+        rows = list(self.session.scalars(statement))
+        for judgement in reversed(rows) if force else rows:
+            if force and judgement.content_item_id in seen:
+                continue
+            seen.add(judgement.content_item_id)
             if judgement.output_json.get("is_relevant") is not True:
                 continue
-            if self.has_existing_signals(judgement.content_item_id, judgement.id):
+            if not force and self.has_existing_signals(judgement.content_item_id, judgement.id):
                 continue
             item = self.session.get(ContentItemRecord, judgement.content_item_id)
             if item is None:

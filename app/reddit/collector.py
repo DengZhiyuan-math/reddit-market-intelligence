@@ -1,6 +1,8 @@
 """Read-only Reddit collection orchestration."""
 
 from collections.abc import Callable
+from itertools import islice
+from app.llm.transport import RunBudget, BudgetExceeded
 import logging
 from time import monotonic
 from typing import Any
@@ -8,7 +10,11 @@ from typing import Any
 from app.config import Settings
 from app.observability import log_event
 from app.reddit.models import CollectionRunSummary, RedditCommentSnapshot, RedditPostSnapshot
-from app.reddit.rate_limiter import RetryPolicy, parse_rate_limit_headers, should_stop_for_rate_limit
+from app.reddit.rate_limiter import (
+    RetryPolicy,
+    parse_rate_limit_headers,
+    should_stop_for_rate_limit,
+)
 from app.reddit.repository import RedditCollectionRepository
 
 
@@ -26,6 +32,9 @@ class RedditCollector:
         *,
         retry_policy: RetryPolicy | None = None,
         sleep: Callable[[float], None] | None = None,
+        budget: RunBudget | None = None,
+        strict_stop: bool = False,
+        selected_query_ids: list[int] | None = None,
     ) -> None:
         self.reddit = reddit
         self.repository = repository
@@ -35,6 +44,13 @@ class RedditCollector:
             backoff_seconds=settings.reddit_retry_backoff_seconds,
         )
         self.sleep = sleep
+        self.budget, self.strict_stop, self.selected_query_ids = (
+            budget,
+            strict_stop,
+            selected_query_ids,
+        )
+        self.seen = {"reddit_post": set(), "reddit_comment": set()}
+        self.before = {"reddit_post": set(), "reddit_comment": set()}
 
     def collect_posts(
         self,
@@ -47,6 +63,12 @@ class RedditCollector:
         started = monotonic()
         project = self.repository.get_project_by_project_id(project_id)
         queries = self.repository.list_pending_search_queries(project.id)
+        if self.selected_query_ids is not None:
+            queries = [self.repository.get_search_query(qid) for qid in self.selected_query_ids]
+            if any(query is None or query.project_id != project.id for query in queries):
+                raise ValueError("Selected API query is missing or belongs to another project")
+        if self.strict_stop:
+            self.before = self.repository.project_source_ids(project.id)
         summary = CollectionRunSummary(requested_queries=len(queries))
         log_event(
             logger,
@@ -57,6 +79,15 @@ class RedditCollector:
             item_count_in=len(queries),
         )
         for query in queries:
+            remaining = (
+                self.budget.max_items - sum(map(len, self.seen.values()))
+                if self.budget
+                else limit_per_query
+            )
+            if remaining <= 0:
+                break
+            if self.budget:
+                self.budget.source_request()
             request = self.repository.create_request_log(
                 project_db_id=project.id,
                 run_id=run_id,
@@ -73,16 +104,25 @@ class RedditCollector:
             )
             request_started = monotonic()
             try:
-                submissions = self.retry_policy.run(
-                    lambda query=query: list(
-                        self.reddit.subreddit(query.subreddit).search(
-                            query.query,
-                            sort=query.sort or "relevance",
-                            time_filter=query.time_filter or "all",
-                            limit=limit_per_query,
+                request_limit = min(limit_per_query, remaining)
+
+                def operation():
+                    return list(
+                        islice(
+                            self.reddit.subreddit(query.subreddit).search(
+                                query.query,
+                                sort=query.sort or "relevance",
+                                time_filter=query.time_filter or "all",
+                                limit=request_limit,
+                            ),
+                            request_limit,
                         )
-                    ),
-                    sleep=self.sleep,
+                    )
+
+                submissions = (
+                    operation()
+                    if self.strict_stop
+                    else self.retry_policy.run(operation, sleep=self.sleep)
                 )
             except Exception as exc:
                 summary.request_failures += 1
@@ -104,6 +144,8 @@ class RedditCollector:
                     elapsed_ms=_elapsed_ms(request_started),
                 )
                 self.repository.mark_search_query_status(query.id, "failed")
+                if self.strict_stop:
+                    raise
                 continue
 
             response_headers = _headers_from_listing(submissions)
@@ -125,15 +167,19 @@ class RedditCollector:
                 summary.rate_limit_stops += 1
 
             for submission in submissions:
-                raw_post, inserted = self.repository.upsert_raw_post(
-                    RedditPostSnapshot.from_submission(submission)
-                )
+                post_snapshot = RedditPostSnapshot.from_submission(submission)
+                self.seen["reddit_post"].add(post_snapshot.reddit_post_id)
+                if self.strict_stop and post_snapshot.reddit_post_id in self.before["reddit_post"]:
+                    summary.duplicate_posts_skipped += 1
+                    continue
+                raw_post, inserted = self.repository.upsert_raw_post(post_snapshot)
                 _, linked = self.repository.link_project_post(
                     project_db_id=project.id,
                     run_id=run_id,
                     search_query=query,
                     request_id=request.id,
                     raw_post=raw_post,
+                    snapshot=post_snapshot,
                 )
                 if inserted and linked:
                     summary.stored_posts += 1
@@ -148,6 +194,8 @@ class RedditCollector:
             )
             self.repository.mark_search_query_status(query.id, "completed")
             if summary.rate_limit_stops:
+                if self.strict_stop:
+                    raise BudgetExceeded("Reddit rate-limit stop")
                 break
 
         summary.elapsed_ms = _elapsed_ms(started)
@@ -176,7 +224,9 @@ class RedditCollector:
 
         started = monotonic()
         project = self.repository.get_project_by_project_id(project_id)
-        project_posts = self.repository.list_project_posts_for_comment_collection(project.id, run_id)
+        project_posts = self.repository.list_project_posts_for_comment_collection(
+            project.id, run_id
+        )
         summary = CollectionRunSummary()
         log_event(
             logger,
@@ -187,6 +237,15 @@ class RedditCollector:
             item_count_in=len(project_posts),
         )
         for project_post in project_posts:
+            remaining = (
+                self.budget.max_items - sum(map(len, self.seen.values()))
+                if self.budget
+                else max_comments_per_post
+            )
+            if remaining <= 0:
+                break
+            if self.budget:
+                self.budget.source_request()
             raw_post = self.repository.get_raw_post(project_post.reddit_post_raw_id)
             request = self.repository.create_request_log(
                 project_db_id=project.id,
@@ -200,10 +259,17 @@ class RedditCollector:
             )
             request_started = monotonic()
             try:
-                submission = self.retry_policy.run(
-                    lambda raw_post=raw_post: self.reddit.submission(id=raw_post.reddit_post_id),
-                    sleep=self.sleep,
+
+                def operation():
+                    return self.reddit.submission(id=raw_post.reddit_post_id)
+
+                submission = (
+                    operation()
+                    if self.strict_stop
+                    else self.retry_policy.run(operation, sleep=self.sleep)
                 )
+                if self.strict_stop:
+                    submission.comment_limit = min(max_comments_per_post, remaining)
                 submission.comments.replace_more(limit=0)
             except Exception as exc:
                 summary.request_failures += 1
@@ -224,22 +290,31 @@ class RedditCollector:
                     error=str(exc),
                     elapsed_ms=_elapsed_ms(request_started),
                 )
+                if self.strict_stop:
+                    raise
                 continue
 
-            for comment in list(submission.comments)[:max_comments_per_post]:
-                raw_comment, inserted = self.repository.upsert_raw_comment(
-                    RedditCommentSnapshot.from_comment(
-                        comment,
-                        reddit_post_id=raw_post.reddit_post_id,
-                        depth=0,
-                    )
+            for comment in islice(submission.comments, min(max_comments_per_post, remaining)):
+                comment_snapshot = RedditCommentSnapshot.from_comment(
+                    comment,
+                    reddit_post_id=raw_post.reddit_post_id,
+                    depth=0,
                 )
+                self.seen["reddit_comment"].add(comment_snapshot.reddit_comment_id)
+                if (
+                    self.strict_stop
+                    and comment_snapshot.reddit_comment_id in self.before["reddit_comment"]
+                ):
+                    summary.duplicate_comments_skipped += 1
+                    continue
+                raw_comment, inserted = self.repository.upsert_raw_comment(comment_snapshot)
                 _, linked = self.repository.link_project_comment(
                     project_db_id=project.id,
                     run_id=run_id,
                     search_query_id=project_post.search_query_id,
                     request_id=request.id,
                     raw_comment=raw_comment,
+                    snapshot=comment_snapshot,
                 )
                 if inserted and linked:
                     summary.stored_comments += 1

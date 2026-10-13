@@ -131,6 +131,40 @@ def test_dry_run_returns_candidate_summary_without_writes() -> None:
     assert len(session.scalars(select(MarketSignalRecord)).all()) == 0
 
 
+def test_extraction_preserves_negative_cosine_input_for_eligible_evidence() -> None:
+    session = make_session()
+    project = seed_project(session)
+    item = add_accepted_item(session, project)
+    item.relevance_score = -0.14558080789134803
+
+    class CheckingProvider(DeterministicSignalProvider):
+        def extract(self, request):
+            assert request.relevance_score == -0.14558080789134803
+            return super().extract(request)
+
+    summary = run_signal_extraction(session, 1, provider=CheckingProvider())
+    assert summary.extracted_signals == 1
+    assert summary.failed == 0
+
+
+def test_force_remaining_excludes_successful_abstention() -> None:
+    session = make_session()
+    project = seed_project(session)
+    add_accepted_item(session, project, "one")
+    add_accepted_item(session, project, "two")
+    provider = DeterministicSignalProvider(
+        fixture_output={
+            "status": "abstained",
+            "signals": [],
+            "abstention_reason": "Insufficient evidence",
+            "confidence": 0.9,
+        }
+    )
+    summary = run_signal_extraction(session, 1, limit=1, force=True, provider=provider)
+    assert summary.abstained == 1
+    assert summary.remaining == 1
+
+
 def test_service_uses_settings_default_limit() -> None:
     session = make_session()
     project = seed_project(session)
@@ -203,7 +237,9 @@ def test_invalid_provider_output_creates_failed_call_without_signal() -> None:
     session = make_session()
     project = seed_project(session)
     add_accepted_item(session, project)
-    provider = DeterministicSignalProvider(fixture_output={"status": "extracted", "confidence": 0.9})
+    provider = DeterministicSignalProvider(
+        fixture_output={"status": "extracted", "confidence": 0.9}
+    )
 
     summary = run_signal_extraction(session, 1, provider=provider)
 

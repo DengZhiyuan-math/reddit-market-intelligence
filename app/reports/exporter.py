@@ -15,6 +15,7 @@ CSV_HEADER = [
     "source_type",
     "source_id",
     "source_mode",
+    "source_url",
     "persona",
     "pain_point",
     "urgency",
@@ -30,12 +31,13 @@ def export_report_evidence(
     output_dir: Path | None = None,
     *,
     limit: int = 100,
+    signal_ids: list[int] | None = None,
 ) -> tuple[Path, Path]:
     """Export report evidence as Markdown and CSV for reviewer inspection."""
 
     repository = ReportRepository(session)
     project = repository.get_project_by_project_id(project_id)
-    evidence_items = repository.list_evidence_items(project.id, limit=limit)
+    evidence_items = repository.list_evidence_items(project.id, limit=limit, signal_ids=signal_ids)
     resolved_output_dir = output_dir or Path(f"outputs/exports/project-{project_id}")
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -78,6 +80,7 @@ def _render_markdown(
                 f"- source_type: {item.source_type or 'unknown'}",
                 f"- source_id: {item.source_id or 'unknown'}",
                 f"- source_mode: {item.source_mode or 'unknown'}",
+                f"- source_url: {item.source_url or 'unknown'}",
                 f"- persona: {item.persona or 'unknown'}",
                 f"- pain_point: {item.pain_point or 'unknown'}",
                 f"- urgency: {item.urgency or 'unknown'}",
@@ -103,6 +106,7 @@ def _write_csv(path: Path, evidence_items: list[ReportEvidenceItem]) -> None:
                     "source_type": item.source_type or "",
                     "source_id": item.source_id or "",
                     "source_mode": item.source_mode or "",
+                    "source_url": item.source_url or "",
                     "persona": item.persona or "",
                     "pain_point": item.pain_point or "",
                     "urgency": item.urgency or "",

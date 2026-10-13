@@ -37,8 +37,8 @@ def test_deterministic_review_provider_returns_local_metadata() -> None:
     provider = DeterministicReviewProvider()
     result = provider.review(make_request())
 
-    assert result.provider == "codex-local"
-    assert result.model == "gpt-5.2-codex"
+    assert result.provider == "deterministic"
+    assert result.model == "review-rules-v1"
     assert result.raw_response_json is not None
 
 

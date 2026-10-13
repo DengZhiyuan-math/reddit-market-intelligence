@@ -4,10 +4,11 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from app.db.models import ResearchPlanRecord
+from app.db.models import ResearchPlanRecord, LlmCallRecord
+from app.config import Settings
+from app.llm.providers import topic_provider
 from app.topic_planning.models import TopicPlan
 from app.topic_planning.planner import (
-    DeterministicTopicPlanner,
     TopicPlannerProvider,
     TopicPlanningContext,
 )
@@ -55,11 +56,12 @@ def generate_topic_plan_for_project(
     project_id: int,
     *,
     provider: TopicPlannerProvider | None = None,
+    settings: Settings | None = None,
 ) -> TopicPlan:
     """Generate a topic plan for a database project without persisting it."""
 
     project = get_project_by_project_id(session, project_id)
-    planner = provider or DeterministicTopicPlanner()
+    planner = provider or topic_provider(settings or Settings())
     return planner.generate(_context_from_project(project))
 
 
@@ -93,7 +95,9 @@ def persist_topic_plan_for_project(
             topic_plan=topic_plan,
         )
     session.flush()
-    return PersistedTopicPlan(record=record, topic_plan=topic_plan, search_query_count=len(search_queries))
+    return PersistedTopicPlan(
+        record=record, topic_plan=topic_plan, search_query_count=len(search_queries)
+    )
 
 
 def generate_and_persist_topic_plan(
@@ -101,12 +105,33 @@ def generate_and_persist_topic_plan(
     project_id: int,
     *,
     provider: TopicPlannerProvider | None = None,
+    settings: Settings | None = None,
     selected: bool = True,
 ) -> PersistedTopicPlan:
     """Generate and persist a topic plan for a project."""
 
-    topic_plan = generate_topic_plan_for_project(session, project_id, provider=provider)
-    return persist_topic_plan_for_project(session, project_id, topic_plan, selected=selected)
+    planner = provider or topic_provider(settings or Settings())
+    topic_plan = generate_topic_plan_for_project(session, project_id, provider=planner)
+    persisted = persist_topic_plan_for_project(session, project_id, topic_plan, selected=selected)
+    result = getattr(planner, "last_result", None)
+    if result:
+        project = get_project_by_project_id(session, project_id)
+        session.add(
+            LlmCallRecord(
+                project_id=project.id,
+                call_type="topic_planning",
+                provider=result.provider,
+                model_name=result.model,
+                input_json={"topic": project.topic},
+                output_json=result.output,
+                raw_response_json=result.audit(),
+                validation_status="validated",
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+            )
+        )
+        session.flush()
+    return persisted
 
 
 def list_topic_plans(session: Session, project_id: int) -> list[PersistedTopicPlan]:

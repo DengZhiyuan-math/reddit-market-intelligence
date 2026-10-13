@@ -150,6 +150,103 @@ def test_valid_irrelevant_review_increments_irrelevant() -> None:
     assert summary.irrelevant == 1
 
 
+def test_review_accepts_negative_cosine_similarity_without_clamping() -> None:
+    session = make_session()
+    project = seed_project(session)
+    item = add_ambiguous_item(session, project)
+    item.relevance_score = -0.03062101414497503
+
+    class CheckingProvider(DeterministicReviewProvider):
+        def review(self, request: AmbiguityReviewRequest):
+            assert request.relevance_score == -0.03062101414497503
+            return super().review(request)
+
+    summary = run_llm_review(session, 1, provider=CheckingProvider())
+
+    assert summary.reviewed == 1
+    assert summary.relevant == 1
+    assert summary.failed == 0
+    assert summary.remaining == 0
+
+
+def test_comment_review_uses_project_parent_snapshot_without_merging_text(tmp_path) -> None:
+    import json
+    from app.reddit.export_import import import_reddit_export
+
+    session = make_session()
+    project = seed_project(session)
+    path = tmp_path / "rows.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "post",
+                    "id": "abc",
+                    "post_id": "abc",
+                    "subreddit": "zurich",
+                    "title": "Local maths tutor",
+                    "text": "My child needs help in Zurich.",
+                    "created_utc": None,
+                    "score": None,
+                    "num_comments": None,
+                    "source_url": "https://www.reddit.com/r/zurich/comments/abc/local/",
+                },
+                {
+                    "type": "comment",
+                    "id": "c1",
+                    "post_id": "abc",
+                    "subreddit": "zurich",
+                    "title": None,
+                    "created_utc": None,
+                    "score": None,
+                    "num_comments": None,
+                    "text": "Can they travel alone?",
+                    "parent_id": "t3_abc",
+                    "source_url": "https://www.reddit.com/r/zurich/comments/abc/local/c1/",
+                },
+            ]
+        )
+    )
+    import_reddit_export(session, project_id=1, input_path=path, acquisition_method="dom")
+    item = add_ambiguous_item(session, project, "c1")
+    item.source_type = "reddit_comment"
+    item.text = item.cleaned_text = "Can they travel alone?"
+
+    class CheckingProvider(DeterministicReviewProvider):
+        def review(self, request):
+            assert request.text == "Can they travel alone?"
+            assert request.subreddit == "zurich"
+            assert request.metadata["parent_post"]["text"] == "My child needs help in Zurich."
+            assert request.metadata["parent_post"]["source_id"] == "abc"
+            assert request.metadata["parent_comment"] is None
+            return super().review(request)
+
+    assert run_llm_review(session, 1, provider=CheckingProvider()).reviewed == 1
+
+    from app.analysis.gateway import DeterministicSignalProvider
+    from app.analysis.service import run_signal_extraction
+
+    item.final_status = "accepted"
+
+    class CheckingExtractor(DeterministicSignalProvider):
+        def extract(self, request):
+            assert request.text == "Can they travel alone?"
+            assert request.metadata["parent_post"]["title"] == "Local maths tutor"
+            return super().extract(request)
+
+    assert run_signal_extraction(session, 1, provider=CheckingExtractor()).extracted_signals == 1
+
+    class ParentQuoteExtractor(DeterministicSignalProvider):
+        def extract(self, request):
+            result = super().extract(request)
+            result.output["signals"][0]["useful_quote"] = "My child needs help in Zurich."
+            return result
+
+    rejected = run_signal_extraction(session, 1, provider=ParentQuoteExtractor(), force=True)
+    assert rejected.failed == 1
+    assert rejected.extracted_signals == 0
+
+
 def test_invalid_provider_output_persists_failed_call_without_judgement() -> None:
     session = make_session()
     project = seed_project(session)

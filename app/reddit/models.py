@@ -119,7 +119,7 @@ class RedditCommentSnapshot(BaseModel):
     body: str | None = None
     author: str | None = None
     score: int | None = None
-    depth: int = 0
+    depth: int | None = 0
     created_utc: int | None = None
     permalink: str | None = None
     raw_json: dict[str, Any] = Field(default_factory=dict)
@@ -159,3 +159,25 @@ class RedditCommentSnapshot(BaseModel):
             permalink=getattr(comment, "permalink", None),
             raw_json=raw_json,
         )
+
+
+class ExportImportSummary(BaseModel):
+    """Distinct captured evidence and persistence counts for an offline batch."""
+
+    run_id: int | None = None
+    dry_run: bool = False
+    captured_posts: int = 0
+    captured_comments: int = 0
+    stored_posts: int = 0
+    stored_comments: int = 0
+    duplicate_posts: int = 0
+    duplicate_comments: int = 0
+    in_file_duplicates: int = 0
+    new_post_links: int = 0
+    new_comment_links: int = 0
+    missing_fields: dict[str, int] = Field(default_factory=dict)
+    nested_replies: int = 0
+    more_markers: list[dict[str, Any]] = Field(default_factory=list)
+    post_coverage: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)

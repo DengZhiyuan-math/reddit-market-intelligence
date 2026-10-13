@@ -19,6 +19,7 @@ from app.db.models import (
 )
 from app.reddit.models import (
     CollectionRunSummary,
+    ExportImportSummary,
     RateLimitSnapshot,
     RedditCommentSnapshot,
     RedditPostSnapshot,
@@ -91,6 +92,12 @@ class RedditCollectionRepository:
         self.session.flush()
         return query
 
+    def project_source_ids(self, project_db_id: int) -> dict[str, set[str]]:
+        """Canonical source IDs already associated with this project."""
+        posts = self.session.scalars(select(RedditPostRawRecord.reddit_post_id).join(ProjectRedditPostRecord, ProjectRedditPostRecord.reddit_post_raw_id == RedditPostRawRecord.id).where(ProjectRedditPostRecord.project_id == project_db_id))
+        comments = self.session.scalars(select(RedditCommentRawRecord.reddit_comment_id).join(ProjectRedditCommentRecord, ProjectRedditCommentRecord.reddit_comment_raw_id == RedditCommentRawRecord.id).where(ProjectRedditCommentRecord.project_id == project_db_id))
+        return {"reddit_post": set(posts), "reddit_comment": set(comments)}
+
     def upsert_raw_post(self, snapshot: RedditPostSnapshot) -> tuple[RedditPostRawRecord, bool]:
         """Insert or return a globally deduplicated raw Reddit post."""
 
@@ -128,6 +135,7 @@ class RedditCollectionRepository:
         search_query: SearchQueryRecord,
         request_id: int | None,
         raw_post: RedditPostRawRecord,
+        snapshot: RedditPostSnapshot | None = None,
     ) -> tuple[ProjectRedditPostRecord, bool]:
         """Create or return project/query provenance for a raw Reddit post."""
 
@@ -140,6 +148,12 @@ class RedditCollectionRepository:
         )
         if existing is not None:
             return existing, False
+        metadata = {**search_query.filters_json, "acquisition_method": "reddit_api"}
+        if snapshot is not None:
+            metadata.update(
+                source_snapshot=snapshot.model_dump(mode="json", exclude={"raw_json"}),
+                source_url=snapshot.permalink,
+            )
         record = ProjectRedditPostRecord(
             project_id=project_db_id,
             run_id=run_id,
@@ -150,7 +164,7 @@ class RedditCollectionRepository:
             query=search_query.query,
             sort=search_query.sort,
             time_filter=search_query.time_filter,
-            filters_json=search_query.filters_json,
+            filters_json=metadata,
         )
         self.session.add(record)
         self.session.flush()
@@ -165,6 +179,8 @@ class RedditCollectionRepository:
         subreddit: str | None,
         query: str | None,
         filters_json: dict[str, Any] | None = None,
+        sort: str | None = None,
+        time_filter: str | None = None,
     ) -> tuple[ProjectRedditPostRecord, bool]:
         """Create or return project provenance for a fallback-discovered post."""
 
@@ -185,6 +201,8 @@ class RedditCollectionRepository:
             reddit_post_raw_id=raw_post.id,
             subreddit=subreddit,
             query=query,
+            sort=sort,
+            time_filter=time_filter,
             filters_json=filters_json or {},
         )
         self.session.add(record)
@@ -263,6 +281,12 @@ class RedditCollectionRepository:
         search_query_id: int | None,
         request_id: int | None,
         raw_comment: RedditCommentRawRecord,
+        filters_json: dict[str, Any] | None = None,
+        subreddit: str | None = None,
+        discovery_query: str | None = None,
+        sort: str | None = None,
+        time_filter: str | None = None,
+        snapshot: RedditCommentSnapshot | None = None,
     ) -> tuple[ProjectRedditCommentRecord, bool]:
         """Create or return project/query provenance for a raw Reddit comment."""
 
@@ -276,17 +300,29 @@ class RedditCollectionRepository:
         if existing is not None:
             return existing, False
         query = self.get_search_query(search_query_id)
+        metadata = (
+            {**query.filters_json, "acquisition_method": "reddit_api"}
+            if query is not None
+            else filters_json
+            or ({"acquisition_method": "reddit_api"} if request_id is not None else {})
+        )
+        if snapshot is not None:
+            metadata = {
+                **metadata,
+                "source_snapshot": snapshot.model_dump(mode="json", exclude={"raw_json"}),
+                "source_url": snapshot.permalink,
+            }
         record = ProjectRedditCommentRecord(
             project_id=project_db_id,
             run_id=run_id,
             search_query_id=search_query_id,
             request_id=request_id,
             reddit_comment_raw_id=raw_comment.id,
-            subreddit=query.subreddit if query is not None else None,
-            query=query.query if query is not None else None,
-            sort=query.sort if query is not None else None,
-            time_filter=query.time_filter if query is not None else None,
-            filters_json=query.filters_json if query is not None else {},
+            subreddit=query.subreddit if query is not None else subreddit,
+            query=query.query if query is not None else discovery_query,
+            sort=query.sort if query is not None else sort,
+            time_filter=query.time_filter if query is not None else time_filter,
+            filters_json=metadata,
         )
         self.session.add(record)
         self.session.flush()
@@ -296,7 +332,7 @@ class RedditCollectionRepository:
         self,
         run_id: int,
         status: str,
-        summary: CollectionRunSummary,
+        summary: CollectionRunSummary | ExportImportSummary,
     ) -> PipelineRunRecord:
         """Persist final run status and summary counters."""
 

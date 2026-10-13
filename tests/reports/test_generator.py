@@ -151,3 +151,29 @@ def test_fallback_source_mode_adds_report_caveat_and_appendix_label() -> None:
     assert "public-web fallback collection" in markdown
     assert "not official Reddit API collection" in markdown
     assert "source_mode: web_static" in markdown
+
+
+def test_import_caveats_are_rendered_when_no_trusted_signal_exists() -> None:
+    summary = ReportDatasetSummary(
+        import_batches=[
+            {
+                "run_id": 1,
+                "capture": {
+                    "acquisition_method": "dom",
+                    "filename": "empty.json",
+                    "captured_at": None,
+                },
+                "coverage": {
+                    "captured_posts": 0,
+                    "captured_comments": 0,
+                    "missing_fields": {"text": 1},
+                },
+            }
+        ]
+    )
+    report = build_market_report(1, "No evidence", [], summary)
+    markdown = render_market_report_markdown(report)
+    assert "insufficient evidence" in markdown
+    assert "only loaded page content" in markdown
+    assert "captured_at=unknown" in markdown
+    assert "missing fields={'text': 1}" in markdown

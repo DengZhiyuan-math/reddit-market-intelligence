@@ -37,8 +37,8 @@ def test_deterministic_provider_returns_codex_local_by_default() -> None:
 
     result = provider.extract(make_request())
 
-    assert result.provider == "codex-local"
-    assert result.model == "gpt-5.2-codex"
+    assert result.provider == "deterministic"
+    assert result.model == "signal-rules-v1"
 
 
 def test_valid_provider_output_returns_validated_status() -> None:

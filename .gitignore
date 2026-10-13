@@ -21,3 +21,16 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Private source evidence and collection state
+research/
+data/raw/
+data/exports/
+data/captures/
+browser-task*.json
+browser-capture*.json
+dom-observations*.json
+*.har
+*.log
+*.egg-info/
+._*

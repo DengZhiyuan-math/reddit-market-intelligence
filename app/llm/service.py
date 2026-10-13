@@ -5,9 +5,9 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.llm.providers import review_provider
 from app.db.models import ContentItemRecord, ResearchPlanRecord, ResearchProjectRecord
 from app.llm.gateway import (
-    DeterministicReviewProvider,
     LlmReviewProvider,
     validate_provider_result,
 )
@@ -15,6 +15,7 @@ from app.llm.models import AmbiguityReviewRequest, LlmReviewRunSummary, LlmValid
 from app.llm.prompts import build_ambiguity_review_prompt
 from app.llm.repository import LlmReviewRepository
 from app.observability import log_event
+from app.processing.repository import ProcessingRepository
 
 
 class LlmReviewServiceError(RuntimeError):
@@ -32,14 +33,13 @@ def run_llm_review(
     provider: LlmReviewProvider | None = None,
     *,
     settings: Settings | None = None,
+    content_ids: list[int] | None = None,
+    force: bool = False,
 ) -> LlmReviewRunSummary:
     """Review pending ambiguous content items and persist validated judgements."""
 
     resolved_settings = settings or Settings()
-    resolved_provider = provider or DeterministicReviewProvider(
-        provider=resolved_settings.llm_review_provider,
-        model=resolved_settings.llm_review_model,
-    )
+    resolved_provider = provider or review_provider(resolved_settings)
     resolved_limit = limit if limit is not None else resolved_settings.llm_review_default_limit
     repository = LlmReviewRepository(session)
     project = repository.get_project_by_project_id(project_id)
@@ -56,7 +56,9 @@ def run_llm_review(
         status="dry_run" if dry_run else "started",
     )
     try:
-        pending_items = repository.list_pending_ambiguity_items(project.id, limit=resolved_limit)
+        pending_items = repository.list_pending_ambiguity_items(
+            project.id, limit=resolved_limit, content_ids=content_ids, force=force
+        )
         if dry_run:
             summary.skipped = len(pending_items)
             summary.remaining = repository.count_remaining_ambiguity_items(project.id)
@@ -84,10 +86,11 @@ def run_llm_review(
             },
         )
         for content_item in pending_items:
-            if repository.has_validated_ambiguity_judgement(content_item.id):
+            if not force and repository.has_validated_ambiguity_judgement(content_item.id):
                 summary.skipped += 1
                 continue
-            request = _build_review_request(project, topic_plan, content_item)
+            context = ProcessingRepository(session).get_source_context(content_item)
+            request = _build_review_request(project, topic_plan, content_item, context)
             prompt_payload = build_ambiguity_review_prompt(request)
             provider_result = resolved_provider.review(request)
             validation = validate_provider_result(provider_result)
@@ -178,6 +181,7 @@ def _build_review_request(
     project: ResearchProjectRecord,
     topic_plan: ResearchPlanRecord | None,
     content_item: ContentItemRecord,
+    context: dict,
 ) -> AmbiguityReviewRequest:
     plan_json = topic_plan.plan_json if topic_plan is not None else {}
     return AmbiguityReviewRequest(
@@ -188,6 +192,7 @@ def _build_review_request(
         text=content_item.cleaned_text or content_item.text,
         source_type=content_item.source_type,
         source_id=content_item.source_id,
+        subreddit=context["subreddit"],
         language=content_item.language,
         relevance_score=content_item.relevance_score,
         quality_score=content_item.quality_score,
@@ -196,6 +201,7 @@ def _build_review_request(
         persona_labels=list(plan_json.get("persona_labels") or []),
         pain_point_labels=list(plan_json.get("pain_point_labels") or []),
         metadata={
+            **context,
             "source_table": content_item.source_table,
             "final_status": content_item.final_status,
             "llm_review_required": content_item.llm_review_required,

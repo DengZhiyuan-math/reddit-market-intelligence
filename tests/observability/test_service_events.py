@@ -60,7 +60,8 @@ def test_llm_review_logs_model_validation_without_prompt_text(caplog) -> None:
     messages = "\n".join(record.getMessage() for record in caplog.records)
 
     assert validation["stage"] == "llm_review"
-    assert validation["llm_model"] == "gpt-5.2-codex"
+    assert validation["llm_provider"] == "deterministic"
+    assert validation["llm_model"] == "review-rules-v1"
     assert validation["status"] == "validated"
     assert "Can anyone recommend a math tutor in Zurich?" not in messages
     assert "input_prompt" not in messages
@@ -81,7 +82,8 @@ def test_analysis_logs_model_and_output_counts_without_source_text(caplog) -> No
     messages = "\n".join(record.getMessage() for record in caplog.records)
 
     assert completed["stage"] == "market_signal_extraction"
-    assert completed["llm_model"] == "gpt-5.2-codex"
+    assert completed["llm_provider"] == "deterministic"
+    assert completed["llm_model"] == "signal-rules-v1"
     assert completed["item_count_out"] >= 1
     assert "Can anyone recommend a math tutor in Zurich?" not in messages
 

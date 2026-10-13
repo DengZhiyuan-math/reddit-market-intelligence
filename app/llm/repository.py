@@ -88,6 +88,8 @@ class LlmReviewRepository:
         self,
         project_db_id: int,
         limit: int | None = None,
+        content_ids: list[int] | None = None,
+        force: bool = False,
     ) -> list[ContentItemRecord]:
         """Return content items that still need ambiguity review."""
 
@@ -97,10 +99,13 @@ class LlmReviewRepository:
                 ContentItemRecord.project_id == project_db_id,
                 ContentItemRecord.final_status == AMBIGUOUS,
                 ContentItemRecord.llm_review_required.is_(True),
-                ~self._validated_judgement_exists(),
             )
             .order_by(ContentItemRecord.ambiguity_score.desc().nullslast(), ContentItemRecord.id)
         )
+        if not force:
+            statement = statement.where(~self._validated_judgement_exists())
+        if content_ids is not None:
+            statement = statement.where(ContentItemRecord.id.in_(content_ids))
         if limit is not None:
             statement = statement.limit(limit)
         return list(self.session.scalars(statement))

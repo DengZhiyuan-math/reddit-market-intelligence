@@ -210,6 +210,7 @@ def _render_evidence_appendix(evidence_items: list[ReportEvidenceItem]) -> list[
                 f"- source_type: {item.source_type or 'unknown'}",
                 f"- source_id: {item.source_id or 'unknown'}",
                 f"- source_mode: {item.source_mode or 'unknown'}",
+                f"- source_url: {item.source_url or 'unknown'}",
                 f"- quote: {item.quote or 'n/a'}",
                 f"- persona: {item.persona or 'unknown'}",
                 f"- pain_point: {item.pain_point or 'unknown'}",
@@ -233,6 +234,11 @@ def _dataset_overview_section(summary: ReportDatasetSummary) -> ReportSection:
             f"{summary.buying_signal_counts}; source modes: {summary.source_mode_counts}; "
             f"abstained extraction calls: "
             f"{summary.abstained_count}; uncertain extraction calls: {summary.uncertain_count}."
+            + (
+                f"\n\nImport capture history: {len(summary.import_batches)} batches; unique returned posts: {summary.import_unique_posts}; Captured comments: {summary.import_unique_comments}; identifiable discussion IDs: {summary.import_discussions}. Repeated captures do not increase these unique counts. Coverage: {summary.import_coverage}."
+                if summary.import_batches
+                else ""
+            )
         ),
     )
 
@@ -265,7 +271,9 @@ def _community_section(evidence_ids: list[int], caveats: list[str]) -> ReportSec
             f"and use specific helpful answers informed by Evidence: {_signal_ids_text(evidence_ids)}."
         ),
         evidence_ids=evidence_ids,
-        caveats=["Every Reddit participation action should remain manual and subreddit-rule-aware."],
+        caveats=[
+            "Every Reddit participation action should remain manual and subreddit-rule-aware."
+        ],
     )
 
 
@@ -277,7 +285,7 @@ def _methodology_section(summary: ReportDatasetSummary) -> ReportSection:
             "evidence. Abstained and uncertain LLM extraction calls are counted in "
             f"metadata ({summary.abstained_count} abstained, {summary.uncertain_count} "
             "uncertain) but are not used as evidence for claims. Reddit evidence is "
-            "qualitative and not representative market truth."
+            "qualitative and not representative market truth." + _import_methodology(summary)
         ),
     )
 
@@ -295,18 +303,46 @@ def _limitations_section(summary: ReportDatasetSummary, caveats: list[str]) -> R
 
 
 def _source_mode_caveats(summary: ReportDatasetSummary) -> list[str]:
-    fallback_count = summary.source_mode_counts.get("web_static", 0) + summary.source_mode_counts.get(
+    fallback_count = summary.source_mode_counts.get(
+        "web_static", 0
+    ) + summary.source_mode_counts.get(
         "web_browser",
         0,
     )
-    if fallback_count == 0:
-        return []
-    return [
-        (
-            f"{fallback_count} content item(s) came from public-web fallback collection, "
-            "not official Reddit API collection; treat them as separately caveated evidence."
+    caveats = (
+        [
+            (
+                f"{fallback_count} content item(s) came from public-web fallback collection, "
+                "not official Reddit API collection; treat them as separately caveated evidence."
+            )
+        ]
+        if fallback_count
+        else []
+    )
+    methods = set(summary.source_mode_counts) | {
+        batch["capture"].get("acquisition_method") for batch in summary.import_batches
+    }
+    descriptions = {
+        "web_json": "web_json: saved Reddit JSON response without an operator API Key. The external exporter still uses a Reddit data endpoint; only returned comments are included.",
+        "manual_web": "manual_web: selected saved webpage content. Human selection and expansion determine the sample; omitted comments remain unknown.",
+        "dom": "dom: only loaded page content. Unloaded comments are absent; page loading does not prove a complete comment tree.",
+    }
+    caveats.extend(text for method, text in descriptions.items() if method in methods)
+    if summary.import_batches:
+        caveats.append(
+            "Comment completeness is unknown unless more markers prove incomplete coverage. Source num_comments is metadata, never a captured-comment count. Missing text cannot support quotes. Capture/import times are separate from publication time. Discussion IDs are not independent-user counts."
         )
-    ]
+    return caveats
+
+
+def _import_methodology(summary: ReportDatasetSummary) -> str:
+    lines = []
+    for batch in summary.import_batches:
+        capture, coverage = batch["capture"], batch["coverage"]
+        lines.append(
+            f"\n\nCapture batch {batch['run_id']}: method={capture.get('acquisition_method')}; filename={capture.get('filename')}; SHA-256={capture.get('file_sha256')}; source={capture.get('source_url') or 'unknown'}; query={capture.get('query') or 'unknown'}; sort={capture.get('sort') or 'unknown'}; time window={capture.get('time_window') or 'unknown'}; captured_at={capture.get('captured_at') or 'unknown'}; imported_at={capture.get('imported_at')}; actual returned posts/comments={coverage.get('captured_posts', 0)}/{coverage.get('captured_comments', 0)}; more markers={coverage.get('more_markers', [])}; missing fields={coverage.get('missing_fields', {})}; per-post coverage={coverage.get('post_coverage', {})}."
+        )
+    return "".join(lines)
 
 
 def _top_label(counts: dict[str, int]) -> str:

@@ -3,7 +3,7 @@
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.llm.models import LlmValidationStatus
 
@@ -38,7 +38,7 @@ class EvidenceCandidate(BaseModel):
     source_mode: str = "reddit_api"
     text: str = Field(min_length=1)
     language: str | None = None
-    relevance_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    relevance_score: float | None = Field(default=None, ge=-1.0, le=1.0)
     quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
     llm_judgement_id: int | None = None
     ambiguity_judgement_json: dict[str, Any] | None = None
@@ -47,6 +47,8 @@ class EvidenceCandidate(BaseModel):
 
 class MarketSignalOutput(BaseModel):
     """One coherent extracted market insight."""
+
+    model_config = ConfigDict(extra="forbid")
 
     user_persona: str = Field(min_length=1)
     user_problem: str = Field(min_length=1)
@@ -74,7 +76,7 @@ class SignalExtractionRequest(BaseModel):
     source_id: str
     source_mode: str = "reddit_api"
     language: str | None = None
-    relevance_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    relevance_score: float | None = Field(default=None, ge=-1.0, le=1.0)
     quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
     llm_judgement_id: int | None = None
     ambiguity_judgement_json: dict[str, Any] | None = None
@@ -84,6 +86,8 @@ class SignalExtractionRequest(BaseModel):
 
 class SignalExtractionOutput(BaseModel):
     """Validated JSON output for market signal extraction."""
+
+    model_config = ConfigDict(extra="forbid")
 
     status: SignalExtractionStatus
     signals: list[MarketSignalOutput] = Field(default_factory=list)
@@ -96,10 +100,14 @@ class SignalExtractionOutput(BaseModel):
 
         if self.status == SignalExtractionStatus.EXTRACTED and not self.signals:
             raise ValueError("Extracted output must include at least one signal.")
-        if self.status in {
-            SignalExtractionStatus.ABSTAINED,
-            SignalExtractionStatus.UNCERTAIN,
-        } and not self.abstention_reason:
+        if (
+            self.status
+            in {
+                SignalExtractionStatus.ABSTAINED,
+                SignalExtractionStatus.UNCERTAIN,
+            }
+            and not self.abstention_reason
+        ):
             raise ValueError("Abstained or uncertain output must include abstention_reason.")
         return self
 

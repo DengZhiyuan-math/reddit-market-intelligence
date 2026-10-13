@@ -5,7 +5,6 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.analysis.gateway import (
-    DeterministicSignalProvider,
     SignalExtractionProvider,
     validate_signal_provider_result,
 )
@@ -18,6 +17,7 @@ from app.analysis.models import (
 from app.analysis.prompts import build_signal_extraction_prompt
 from app.analysis.repository import SignalExtractionRepository
 from app.config import Settings
+from app.llm.providers import signal_provider
 from app.llm.models import LlmValidationStatus
 from app.observability import log_event
 
@@ -37,21 +37,26 @@ def run_signal_extraction(
     provider: SignalExtractionProvider | None = None,
     *,
     settings: Settings | None = None,
+    content_ids: list[int] | None = None,
+    force: bool = False,
 ) -> SignalExtractionRunSummary:
     """Extract market signals from eligible evidence and persist auditable results."""
 
     resolved_settings = settings or Settings()
-    resolved_provider = provider or DeterministicSignalProvider(
-        provider=resolved_settings.signal_extraction_provider,
-        model=resolved_settings.signal_extraction_model,
+    resolved_provider = provider or signal_provider(resolved_settings)
+    resolved_limit = (
+        limit if limit is not None else resolved_settings.signal_extraction_default_limit
     )
-    resolved_limit = limit if limit is not None else resolved_settings.signal_extraction_default_limit
     repository = SignalExtractionRepository(session)
     project = repository.get_project_by_project_id(project_id)
-    candidates = repository.list_signal_candidates(project.id, limit=resolved_limit)
+    candidates = repository.list_signal_candidates(
+        project.id, limit=resolved_limit, content_ids=content_ids, force=force
+    )
     summary = SignalExtractionRunSummary(
         candidates=len(candidates),
-        remaining=len(repository.list_signal_candidates(project.id)),
+        remaining=len(
+            repository.list_signal_candidates(project.id, content_ids=content_ids, force=force)
+        ),
     )
     log_event(
         logger,
@@ -78,6 +83,7 @@ def run_signal_extraction(
         return summary
 
     run = None
+    completed_candidates = set()
     try:
         run = repository.start_signal_run(
             project.id,
@@ -93,7 +99,9 @@ def run_signal_extraction(
             },
         )
         for candidate in candidates:
-            if repository.has_existing_signals(candidate.content_item_id, candidate.llm_judgement_id):
+            if not force and repository.has_existing_signals(
+                candidate.content_item_id, candidate.llm_judgement_id
+            ):
                 summary.skipped_duplicates += 1
                 continue
             request = _build_signal_request(
@@ -102,7 +110,9 @@ def run_signal_extraction(
             )
             prompt_payload = build_signal_extraction_prompt(request)
             provider_result = resolved_provider.extract(request)
-            validation = validate_signal_provider_result(provider_result, source_text=candidate.text)
+            validation = validate_signal_provider_result(
+                provider_result, source_text=candidate.text
+            )
             log_event(
                 logger,
                 "analysis.signal_extraction.validation",
@@ -128,6 +138,7 @@ def run_signal_extraction(
             if validation.output is None:
                 summary.failed += 1
                 continue
+            completed_candidates.add((candidate.content_item_id, candidate.llm_judgement_id))
             if validation.output.status in {
                 SignalExtractionStatus.ABSTAINED,
                 SignalExtractionStatus.UNCERTAIN,
@@ -142,7 +153,12 @@ def run_signal_extraction(
                     llm_call_id=llm_call.id,
                 )
                 summary.extracted_signals += 1
-        summary.remaining = len(repository.list_signal_candidates(project.id))
+        summary.remaining = sum(
+            (candidate.content_item_id, candidate.llm_judgement_id) not in completed_candidates
+            for candidate in repository.list_signal_candidates(
+                project.id, content_ids=content_ids, force=force
+            )
+        )
     except Exception as exc:
         summary.errors += 1
         log_event(

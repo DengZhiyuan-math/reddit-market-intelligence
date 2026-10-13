@@ -14,6 +14,7 @@ class ReportEvidenceItem(BaseModel):
     source_type: str | None = None
     source_id: str | None = None
     source_mode: str | None = None
+    source_url: str | None = None
     persona: str | None = None
     pain_point: str | None = None
     urgency: str | None = None
@@ -35,6 +36,11 @@ class ReportDatasetSummary(BaseModel):
     source_mode_counts: dict[str, int] = Field(default_factory=dict)
     abstained_count: int = 0
     uncertain_count: int = 0
+    import_batches: list[dict[str, Any]] = Field(default_factory=list)
+    import_unique_posts: int = 0
+    import_unique_comments: int = 0
+    import_discussions: int = 0
+    import_coverage: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class ReportSection(BaseModel):
